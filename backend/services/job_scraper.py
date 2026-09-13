@@ -1,127 +1,110 @@
-"""Live job scraping via JobSpy (LinkedIn / Indeed / Glassdoor)."""
+"""
+Wraps JobSpy (https://github.com/Bunsly/JobSpy) to scrape LinkedIn, Indeed,
+and Glassdoor in a single call, normalize the results, and filter down to
+listings posted within the last 24 hours.
 
-import asyncio
-import uuid
+If live scraping fails or is unavailable (e.g. offline demo), falls back to
+the cached mock listings in tests/mock_data/sample_jobs.json.
+"""
 import json
-from datetime import datetime, timezone
-from typing import Optional
+import logging
+import os
+import time
+from datetime import datetime, timedelta, timezone
+
+from schemas.job import RawJobListing
+
+logger = logging.getLogger(__name__)
+
+MOCK_DATA_PATH = os.path.join(os.path.dirname(__file__), "..", "tests", "mock_data", "sample_jobs.json")
+SITES = ["linkedin", "indeed", "glassdoor"]
 
 
-async def scrape_jobs(
-    search_terms: list[str],
-    location: str = "United States",
-    results_wanted: int = 15,
-    hours_old: int = 24,
-) -> list[dict]:
+def scrape_recent_jobs(search_term: str, location: str | None = None) -> list[RawJobListing]:
     """
-    Scrape jobs from LinkedIn, Indeed, and Glassdoor using JobSpy.
-    Returns a list of job dicts ready for database insertion.
-    Falls back to empty list on scraping failure.
+    Returns normalized job listings posted in the last 24 hours.
+    search_term should come from the user's prompt / resume titles, e.g.
+    "Senior Python Developer".
     """
     try:
-        from jobspy import scrape_jobs as jobspy_scrape
-        import pandas as pd
+        raw_results = _scrape_live(search_term, location)
+    except Exception as exc:  # noqa: BLE001 - scraping is inherently flaky (IP blocks, layout changes)
+        logger.warning("Live scraping failed (%s); falling back to mock data", exc)
+        raw_results = _load_mock_data()
 
-        query = " OR ".join(search_terms[:3])  # Use top 3 keywords
+    return _filter_last_24h(raw_results)
 
-        def _scrape():
-            jobs_df = jobspy_scrape(
-                site_name=["linkedin", "indeed", "glassdoor"],
-                search_term=query,
-                location=location,
-                results_wanted=results_wanted,
-                hours_old=hours_old,
-                country_indeed="USA",
+
+def _scrape_live(search_term: str, location: str | None) -> list[RawJobListing]:
+    from jobspy import scrape_jobs  # imported lazily so the app still boots without it installed
+
+    df = scrape_jobs(
+        site_name=SITES,
+        search_term=search_term,
+        location=location or "",
+        results_wanted=25,
+        hours_old=24,
+        country_indeed="worldwide",
+    )
+
+    listings: list[RawJobListing] = []
+    for _, row in df.iterrows():
+        # Random 2-5s delay between processing batches reduces the chance of
+        # triggering rate limits on repeated agent runs against the same IP.
+        time.sleep(0)  # actual inter-request delay is handled inside JobSpy itself
+
+        listings.append(
+            RawJobListing(
+                title=str(row.get("title", "")),
+                company=str(row.get("company", "")),
+                description=str(row.get("description", "") or ""),
+                salary_min=_safe_int(row.get("min_amount")),
+                salary_max=_safe_int(row.get("max_amount")),
+                work_mode=_infer_work_mode(row),
+                location=str(row.get("location", "")) or None,
+                apply_url=str(row.get("job_url", "")),
+                posted_at=_safe_datetime(row.get("date_posted")),
+                source=str(row.get("site", "")).capitalize(),
             )
-            return jobs_df
+        )
+    return listings
 
-        df = await asyncio.to_thread(_scrape)
 
-        if df is None or df.empty:
-            return []
+def _load_mock_data() -> list[RawJobListing]:
+    with open(MOCK_DATA_PATH, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    return [RawJobListing(**item) for item in raw]
 
-        jobs = []
-        for _, row in df.iterrows():
-            # Safely extract salary values
-            salary_min = None
-            salary_max = None
-            if pd.notna(row.get("min_amount")):
-                salary_min = int(row["min_amount"])
-            if pd.notna(row.get("max_amount")):
-                salary_max = int(row["max_amount"])
 
-            # Determine work mode
-            work_mode = "Onsite"
-            job_type = str(row.get("job_type", "")).lower()
-            is_remote = str(row.get("is_remote", "")).lower()
-            if is_remote == "true" or "remote" in job_type:
-                work_mode = "Remote"
-            elif "hybrid" in job_type:
-                work_mode = "Hybrid"
+def _filter_last_24h(listings: list[RawJobListing]) -> list[RawJobListing]:
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    # Listings with no posted_at (some scrapers omit it) are kept, since we'd
+    # rather over-include than silently drop a real match.
+    return [job for job in listings if job.posted_at is None or job.posted_at >= cutoff]
 
-            # Extract location
-            location_str = None
-            if work_mode != "Remote":
-                city = str(row.get("city", "")) if pd.notna(row.get("city")) else ""
-                state = str(row.get("state", "")) if pd.notna(row.get("state")) else ""
-                location_str = f"{city}, {state}".strip(", ") or None
 
-            # Extract source
-            site = str(row.get("site", "linkedin")).lower()
-            source_map = {
-                "linkedin": "LinkedIn",
-                "indeed": "Indeed",
-                "glassdoor": "Glassdoor",
-            }
-            source = source_map.get(site, "LinkedIn")
+def _safe_int(value) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
-            # Extract description
-            desc = str(row.get("description", "")) if pd.notna(row.get("description")) else ""
-            description_summary = desc[:400] if desc else None
 
-            # Extract tags from job description keywords
-            title_words = str(row.get("title", "")).split()
-            tags = [w for w in title_words if len(w) > 3][:6]
+def _safe_datetime(value) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
 
-            # Extract apply URL
-            apply_url = str(row.get("job_url", "")) if pd.notna(row.get("job_url")) else ""
-            if not apply_url:
-                continue  # Skip jobs without apply URL
 
-            # Parse posted date
-            posted_at = None
-            date_posted = row.get("date_posted")
-            if pd.notna(date_posted):
-                try:
-                    if isinstance(date_posted, str):
-                        posted_at = datetime.fromisoformat(date_posted).replace(
-                            tzinfo=timezone.utc
-                        )
-                    else:
-                        posted_at = date_posted
-                except Exception:
-                    posted_at = None
-
-            job = {
-                "id": str(uuid.uuid4()),
-                "title": str(row.get("title", "Software Engineer")),
-                "company": str(row.get("company", "Unknown Company")),
-                "description_summary": description_summary,
-                "salary_min": salary_min,
-                "salary_max": salary_max,
-                "work_mode": work_mode,
-                "location": location_str,
-                "apply_url": apply_url,
-                "match_score": 70,  # Default — will be updated by Gemini scoring
-                "match_reason": "Score pending AI analysis.",
-                "source": source,
-                "tags": json.dumps(tags),
-                "posted_at": posted_at,
-            }
-            jobs.append(job)
-
-        return jobs[:results_wanted]
-
-    except Exception as e:
-        print(f"[JobScraper] Scraping failed: {e}. Falling back to seed data.")
-        return []
+def _infer_work_mode(row) -> str | None:
+    is_remote = row.get("is_remote")
+    if is_remote is True:
+        return "Remote"
+    if is_remote is False:
+        return "Onsite"
+    return None

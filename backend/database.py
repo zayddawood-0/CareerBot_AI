@@ -1,45 +1,26 @@
-"""Async SQLAlchemy database configuration.
-
-Reads DATABASE_URL from the environment (via python-dotenv) and configures
-an async engine — aiosqlite for local development, asyncpg for production
-PostgreSQL. Exposes the declarative Base, a FastAPI get_db dependency, and
-init_db() for creating tables on startup.
 """
+SQLAlchemy engine/session setup shared by every model and route.
+"""
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
 
-import os
-from typing import AsyncGenerator
+from config import settings
 
-from dotenv import load_dotenv
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import DeclarativeBase, sessionmaker
+connect_args = {}
+if settings.database_url.startswith("sqlite"):
+    # Needed because SQLite by default only allows one thread to talk to it
+    connect_args = {"check_same_thread": False}
 
-load_dotenv()
+engine = create_engine(settings.database_url, connect_args=connect_args)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./careerbot.db")
-
-if DATABASE_URL.startswith("sqlite") and "+aiosqlite" not in DATABASE_URL:
-    DATABASE_URL = DATABASE_URL.replace("sqlite://", "sqlite+aiosqlite://", 1)
-elif DATABASE_URL.startswith("postgresql") and "+asyncpg" not in DATABASE_URL:
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
-
-engine = create_async_engine(DATABASE_URL, echo=False)
-AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+Base = declarative_base()
 
 
-class Base(DeclarativeBase):
-    pass
-
-
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-
-
-async def init_db() -> None:
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+def get_db():
+    """FastAPI dependency that yields a DB session and always closes it."""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()

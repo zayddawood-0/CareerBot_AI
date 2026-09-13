@@ -1,93 +1,67 @@
-"""Job listing endpoints, backed by the database.
+from typing import Literal
 
-Jobs are the rows seeded by the most recent agent for the current session
-(see seed.py / POST /api/agent/start). Filtering and sorting are exposed as
-optional query params for future server-side use, but the existing frontend
-filters/sorts client-side and simply fetches the full list — so this
-endpoint returns a plain JSON array (not a paginated envelope) to match
-what it already expects.
-"""
-
-from typing import Optional
-
-from fastapi import APIRouter, Depends, Header, HTTPException
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import desc, asc
+from sqlalchemy.orm import Session
 
 from database import get_db
-from models.models import AgentState, Job, User
-from schemas.schemas import JobResponse
-from utils import DEFAULT_SESSION_ID, deserialize_list, format_iso
+from models.agent_state import AgentState
+from models.job import Job
+from models.user import User
+from routers.dependencies import get_current_user
+from schemas.job import JobOut, PaginatedJobs
 
-router = APIRouter(prefix="/jobs", tags=["jobs"])
+router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
-
-def _to_job_response(job: Job) -> JobResponse:
-    return JobResponse(
-        id=job.id,
-        title=job.title,
-        company=job.company,
-        description_summary=job.description_summary,
-        salary_min=job.salary_min,
-        salary_max=job.salary_max,
-        work_mode=job.work_mode,
-        location=job.location,
-        apply_url=job.apply_url,
-        match_score=job.match_score,
-        match_reason=job.match_reason,
-        source=job.source,
-        tags=deserialize_list(job.tags),
-        posted_at=format_iso(job.posted_at),
-        found_at=format_iso(job.found_at),
-    )
+SORTABLE_FIELDS = {
+    "match_score": Job.match_score,
+    "posted_at": Job.posted_at,
+    "found_at": Job.found_at,
+    "salary_max": Job.salary_max,
+}
 
 
-@router.get("", response_model=list[JobResponse])
-async def list_jobs(
-    session_id: Optional[str] = None,
-    session_id_header: Optional[str] = Header(None, alias="session_id"),
-    work_mode: Optional[str] = None,
-    sort: str = "match_score",
-    db: AsyncSession = Depends(get_db),
+@router.get("", response_model=PaginatedJobs)
+def list_jobs(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    sort_by: Literal["match_score", "posted_at", "found_at", "salary_max"] = "match_score",
+    sort_dir: Literal["asc", "desc"] = "desc",
+    work_mode: str | None = None,
+    min_score: int | None = Query(None, ge=0, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    resolved_session_id = session_id or session_id_header or DEFAULT_SESSION_ID
+    # Jobs belong to agents, agents belong to the current user — this join
+    # keeps the endpoint scoped to only what this user's agent(s) have found.
+    query = db.query(Job).join(AgentState).filter(AgentState.user_id == current_user.id)
 
-    user_result = await db.execute(select(User).where(User.session_id == resolved_session_id))
-    user = user_result.scalar_one_or_none()
-    if user is None:
-        return []
+    if work_mode:
+        query = query.filter(Job.work_mode == work_mode)
+    if min_score is not None:
+        query = query.filter(Job.match_score >= min_score)
 
-    agent_result = await db.execute(
-        select(AgentState)
-        .where(AgentState.user_id == user.id)
-        .order_by(AgentState.created_at.desc())
+    sort_column = SORTABLE_FIELDS[sort_by]
+    query = query.order_by(desc(sort_column) if sort_dir == "desc" else asc(sort_column))
+
+    total = query.count()
+    items = query.offset((page - 1) * page_size).limit(page_size).all()
+
+    return PaginatedJobs(total=total, page=page, page_size=page_size, items=items)
+
+
+@router.get("/{job_id}", response_model=JobOut)
+def get_job(
+    job_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    job = (
+        db.query(Job)
+        .join(AgentState)
+        .filter(Job.id == job_id, AgentState.user_id == current_user.id)
+        .first()
     )
-    agent = agent_result.scalars().first()
-    if agent is None:
-        return []
-
-    query = select(Job).where(Job.agent_id == agent.id)
-
-    if work_mode and work_mode.lower() != "all":
-        query = query.where(Job.work_mode == work_mode)
-
-    if sort == "newest":
-        query = query.order_by(Job.posted_at.desc())
-    elif sort == "salary":
-        query = query.order_by(Job.salary_max.desc().nulls_last())
-    else:
-        query = query.order_by(Job.match_score.desc())
-
-    result = await db.execute(query)
-    jobs = result.scalars().all()
-
-    return [_to_job_response(job) for job in jobs]
-
-
-@router.get("/{job_id}", response_model=JobResponse)
-async def get_job(job_id: str, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Job).where(Job.id == job_id))
-    job = result.scalar_one_or_none()
     if job is None:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return _to_job_response(job)
+        raise HTTPException(status_code=404, detail="Job not found for this user.")
+    return job

@@ -1,0 +1,38 @@
+[
+  {
+    "title": "Senior Python Developer",
+    "company": "Acme Corp",
+    "description": "Backend role focused on FastAPI microservices, async processing, and cloud infrastructure. 5+ years experience required.",
+    "salary_min": 120000,
+    "salary_max": 160000,
+    "work_mode": "Remote",
+    "location": null,
+    "apply_url": "https://linkedin.com/jobs/view/12345",
+    "posted_at": "2026-09-12T14:30:00+00:00",
+    "source": "LinkedIn"
+  },
+  {
+    "title": "Backend Engineer (FastAPI)",
+    "company": "Globex Systems",
+    "description": "Own the design and delivery of REST APIs, PostgreSQL data models, and background task pipelines using Celery.",
+    "salary_min": 95000,
+    "salary_max": 130000,
+    "work_mode": "Hybrid",
+    "location": "Lahore, Pakistan",
+    "apply_url": "https://indeed.com/viewjob?jk=67890",
+    "posted_at": "2026-09-12T09:00:00+00:00",
+    "source": "Indeed"
+  },
+  {
+    "title": "Junior Backend Developer",
+    "company": "Initech",
+    "description": "Entry-level role building internal tools with Django and PostgreSQL. Training provided.",
+    "salary_min": 40000,
+    "salary_max": 55000,
+    "work_mode": "Onsite",
+    "location": "Karachi, Pakistan",
+    "apply_url": "https://glassdoor.com/job-listing/98765",
+    "posted_at": "2026-09-11T18:00:00+00:00",
+    "source": "Glassdoor"
+  }
+]
